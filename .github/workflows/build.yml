@@ -31,7 +31,7 @@ jobs:
 
       - name: Configurar
 
-        run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DKICKDUCK_COPY=OFF -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64"
+        run: cmake -S KickDuck -B build -DCMAKE_BUILD_TYPE=Release -DKICKDUCK_COPY=OFF -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64"
 
       - name: Compilar
         run: cmake --build build --config Release --target KickDuck_VST3 --parallel
