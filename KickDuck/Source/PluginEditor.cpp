@@ -33,15 +33,17 @@ KickDuckEditor::KickDuckEditor (KickDuckProcessor& p) : AudioProcessorEditor (&p
     modeAtt = std::make_unique<CA> (proc.apvts, "mode", modeBox);
     curveAtt = std::make_unique<CA> (proc.apvts, "curveMode", curveBox);
 
-    addKnob (kAmount, "amount", "Amount");
-    addKnob (kRelease, "release", "Release");
-    addKnob (kThr, "threshold", "Threshold");
-    addKnob (kMix, "mix", "Mix");
-    addKnob (kAttack, "attack", "Attack");
-    addKnob (kHold, "hold", "Hold");
-    addKnob (kLp, "lpFreq", "Graves LP");
-    addKnob (kPhase, "phase", "Fase");
-    addKnob (kDelay, "delay", "Delay");
+    addKnob (kAmount, "amount", "Amount", " %", 0);
+    addKnob (kRelease, "release", "Release", " ms", 0);
+    addKnob (kThr, "threshold", "Threshold", " dB", 1);
+    addKnob (kMix, "mix", "Mix", " %", 0);
+    addKnob (kAttack, "attack", "Attack", " ms", 2);
+    addKnob (kHold, "hold", "Hold", " ms", 1);
+    addKnob (kLp, "lpFreq", "Graves LP", " Hz", 0);
+    addKnob (kPhase, "phase", "Fase", "\xC2\xB0", 1);
+    addKnob (kDelay, "delay", "Delay", " ms", 2);
+    addKnob (kSens, "sens", "Sensibilidad", " %", 0);
+    addKnob (kSmooth, "smooth", "Suavizado", " ms", 1);
 
     for (auto* b : { &fullBtn, &polBtn, &lockPol, &lockPh, &lockDel })
     {
@@ -61,6 +63,8 @@ KickDuckEditor::KickDuckEditor (KickDuckProcessor& p) : AudioProcessorEditor (&p
     undoBtn.onClick = [this] { proc.undoAutoPhase(); };
     addAndMakeVisible (autoBtn);
     addAndMakeVisible (undoBtn);
+    copyBtn.onClick = [this] { proc.requestCopyCurve(); };
+    addAndMakeVisible (copyBtn);
 
     lastSignalMs = Time::getMillisecondCounter();
     updateVisibility();
@@ -69,7 +73,7 @@ KickDuckEditor::KickDuckEditor (KickDuckProcessor& p) : AudioProcessorEditor (&p
 
 KickDuckEditor::~KickDuckEditor() { stopTimer(); }
 
-void KickDuckEditor::addKnob (int idx, const char* paramId, const char* name)
+void KickDuckEditor::addKnob (int idx, const char* paramId, const char* name, const char* unit, int dec)
 {
     auto& k = knobs[idx];
     k.slider.setSliderStyle (Slider::RotaryHorizontalVerticalDrag);
@@ -84,6 +88,8 @@ void KickDuckEditor::addKnob (int idx, const char* paramId, const char* name)
     addAndMakeVisible (k.slider);
     addAndMakeVisible (k.label);
     k.att = std::make_unique<SA> (proc.apvts, paramId, k.slider);
+    k.slider.textFromValueFunction = [u = String::fromUTF8 (unit), dec] (double v) { return String (v, dec) + u; };
+    k.slider.updateText();
 }
 
 void KickDuckEditor::setTab (int t)
@@ -96,11 +102,15 @@ void KickDuckEditor::setTab (int t)
 
 void KickDuckEditor::updateVisibility()
 {
-    manualMode = proc.apvts.getRawParameterValue ("curveMode")->load() > 0.5f;
+    curveIdx = (int) proc.apvts.getRawParameterValue ("curveMode")->load();
+    manualMode = (curveIdx == 2);
+    const bool follow = (curveIdx == 1);
     const bool side = (tab == 0);
     auto show = [this] (int i, bool v) { knobs[i].slider.setVisible (v); knobs[i].label.setVisible (v); };
     show (kAmount, side); show (kRelease, side); show (kThr, side);
-    show (kAttack, side && ! manualMode); show (kHold, side && ! manualMode);
+    show (kAttack, side && ! manualMode); show (kHold, side && curveIdx == 0);
+    show (kSens, side && follow); show (kSmooth, side && follow);
+    copyBtn.setVisible (side);
     show (kMix, true); show (kLp, true);
     show (kPhase, ! side); show (kDelay, ! side);
     curveBox.setVisible (side);
@@ -130,12 +140,13 @@ void KickDuckEditor::resized()
     if (tab == 0)
     {
         ids = { kAmount, kRelease, kThr };
-        if (! manualMode) { ids.push_back (kAttack); ids.push_back (kHold); }
+        if (curveIdx == 0) { ids.push_back (kAttack); ids.push_back (kHold); }
+        if (curveIdx == 1) { ids.push_back (kAttack); ids.push_back (kSens); ids.push_back (kSmooth); }
         ids.push_back (kLp); ids.push_back (kMix);
     }
     else ids = { kPhase, kDelay, kLp, kMix };
 
-    const int cw = 96;
+    const int cw = 88;
     const int total = (int) ids.size() * cw;
     const int gapX = ids.size() > 1 ? jmax (0, (knobRow.getWidth() - 220 - total) / ((int) ids.size() - 1)) : 0;
     int x = knobRow.getX() + 8;
@@ -148,7 +159,7 @@ void KickDuckEditor::resized()
     }
 
     auto side = Rectangle<int> (knobRow.getRight() - 210, knobRow.getY() + 8, 200, knobRow.getHeight() - 16);
-    if (tab == 0) fullBtn.setBounds (side.removeFromTop (30));
+    if (tab == 0) { fullBtn.setBounds (side.removeFromTop (30)); copyBtn.setBounds (side.removeFromTop (34)); }
     else
     {
         autoBtn.setBounds (side.removeFromTop (34).removeFromLeft (110));
@@ -167,8 +178,8 @@ void KickDuckEditor::timerCallback()
     if (proc.kickLevel.load() > 1.0e-4f) lastSignalMs = now;
     noSignal = (now - lastSignalMs) > 1500;
 
-    const bool m = proc.apvts.getRawParameterValue ("curveMode")->load() > 0.5f;
-    if (m != manualMode) { updateVisibility(); resized(); }
+    const int ci = (int) proc.apvts.getRawParameterValue ("curveMode")->load();
+    if (ci != curveIdx) { updateVisibility(); resized(); }
     repaint();
 }
 
@@ -310,6 +321,12 @@ void KickDuckEditor::paint (Graphics& g)
         g.setColour (kOrange);  g.drawText (U8 ("● Kick"), panel.getX() + 14, panel.getY() + 4, 80, 16, Justification::left);
         g.setColour (kCream);   g.drawText (U8 ("● Bajo"), panel.getX() + 84, panel.getY() + 4, 80, 16, Justification::left);
         g.setColour (Colours::white); g.drawText (U8 ("— Curva"), panel.getX() + 154, panel.getY() + 4, 80, 16, Justification::left);
+        if (proc.apvts.getRawParameterValue ("fullBand")->load() < 0.5f)
+        {
+            g.setColour (kAmber);
+            g.drawText (U8 ("Solo afecta por debajo de ") + String ((int) proc.apvts.getRawParameterValue ("lpFreq")->load()) + " Hz",
+                        panel.getRight() - 300, panel.getY() + 4, 286, 16, Justification::right);
+        }
     }
     else
     {
@@ -322,17 +339,19 @@ void KickDuckEditor::paint (Graphics& g)
         g.setColour (kPanel);
         g.fillRoundedRectangle (corrPanel.toFloat(), 12.0f);
         drawCorrelation (g, corrPanel.toFloat().reduced (0.0f, 8.0f));
-
-        const auto st = proc.getAutoPhaseStatus();
-        if (st.isNotEmpty())
-        {
-            g.setColour (kCream); g.setFont (Font (FontOptions (12.0f)));
-            g.drawText (st, knobRow.getRight() - 210, knobRow.getBottom() - 22, 210, 18, Justification::centredRight);
-        }
     }
 
     g.setColour (kPanel);
     g.fillRoundedRectangle (knobRow.toFloat(), 12.0f);
+
+    {
+        const auto st = (tab == 0) ? proc.getCopyStatus() : proc.getAutoPhaseStatus();
+        if (st.isNotEmpty())
+        {
+            g.setColour (kCream); g.setFont (Font (FontOptions (12.0f)));
+            g.drawText (st, knobRow.getRight() - 214, knobRow.getBottom() - 24, 206, 18, Justification::centredRight);
+        }
+    }
 
     g.setFont (Font (FontOptions (12.0f)));
     if (noSignal && (int) proc.apvts.getRawParameterValue ("mode")->load() != 2)

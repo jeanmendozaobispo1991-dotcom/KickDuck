@@ -104,15 +104,17 @@ AudioProcessorValueTreeState::ParameterLayout KickDuckProcessor::createLayout()
     p.push_back (std::make_unique<AudioParameterChoice> (ParameterID { "mode", 1 }, "Modo",
                  StringArray { U8 ("Preciso (14 ms)"), U8 ("Rápido (0 ms)"), "MIDI" }, 0));
     p.push_back (std::make_unique<AudioParameterChoice> (ParameterID { "curveMode", 1 }, "Curva",
-                 StringArray { "Auto", "Manual" }, 0));
+                 StringArray { "Fijo", "Seguir kick", "Manual" }, 0));
     p.push_back (F ("amount", "Amount", { 0.0f, 100.0f, 0.1f }, 100.0f, " %"));
     p.push_back (F ("release", "Release", { 20.0f, 1000.0f, 1.0f, 0.4f }, 180.0f, " ms"));
     p.push_back (F ("threshold", "Threshold", { -60.0f, 0.0f, 0.1f }, -24.0f, " dB"));
     p.push_back (F ("mix", "Mix", { 0.0f, 100.0f, 0.1f }, 100.0f, " %"));
     p.push_back (F ("attack", "Attack", { 0.1f, 20.0f, 0.01f, 0.4f }, 0.5f, " ms"));
     p.push_back (F ("hold", "Hold", { 0.0f, 100.0f, 0.1f }, 5.0f, " ms"));
+    p.push_back (F ("sens", "Sensibilidad", { 0.0f, 100.0f, 0.1f }, 70.0f, " %"));
+    p.push_back (F ("smooth", "Suavizado", { 0.0f, 50.0f, 0.1f }, 5.0f, " ms"));
     p.push_back (F ("lpFreq", "Graves LP", { 40.0f, 500.0f, 1.0f, 0.5f }, 150.0f, " Hz"));
-    p.push_back (std::make_unique<AudioParameterBool> (ParameterID { "fullBand", 1 }, "Banda completa", false));
+    p.push_back (std::make_unique<AudioParameterBool> (ParameterID { "fullBand", 1 }, "Banda completa", true));
     p.push_back (F ("phase", "Fase", { 0.0f, 180.0f, 0.1f }, 0.0f, U8 ("°").toRawUTF8()));
     p.push_back (F ("delay", "Delay", { -14.0f, 20.0f, 0.01f }, 0.0f, " ms"));
     p.push_back (std::make_unique<AudioParameterBool> (ParameterID { "polarity", 1 }, "Polaridad", false));
@@ -142,6 +144,8 @@ KickDuckProcessor::KickDuckProcessor()
     pPhase = apvts.getRawParameterValue ("phase");
     pDelay = apvts.getRawParameterValue ("delay");
     pPol = apvts.getRawParameterValue ("polarity");
+    pSens = apvts.getRawParameterValue ("sens");
+    pSmooth = apvts.getRawParameterValue ("smooth");
 
     for (int i = 0; i < kCurvePoints; ++i)
         curve[(size_t) i] = std::pow (1.0f - (float) i / (float) (kCurvePoints - 1), 1.5f);
@@ -197,6 +201,7 @@ void KickDuckProcessor::prepareToPlay (double sampleRate, int samplesPerBlock)
     for (int c = 0; c < 2; ++c) apX[c] = apY[c] = 0.0f;
     lpKickRaw.reset(); lpBassRaw.reset(); lpKickCorr.reset(); lpBassCorr.reset();
 
+    envF = cpEnv = 0.0f; cpPos = -1; cpHits = 0; cpElapsed = 0; cpActive = false; copyState = 0;
     env = 0.0f;
     envRel = std::exp (-1.0f / (0.010f * (float) sr));
     armed = true; gap = 0; minGap = (int) (0.05 * sr);
@@ -235,11 +240,18 @@ void KickDuckProcessor::processBlock (AudioBuffer<float>& buffer, MidiBuffer& mi
     const int scCh = scBus.getNumChannels();
     if (nCh == 0) return;
 
-    if (capReset.exchange (false)) { capCount = 0; capElapsed = 0; capWait = -1; }
+    if (capReset.exchange (false)) { capCount = 0; capElapsed = 0; capWait = -1; capShown = 0; }
+    if (cpReset.exchange (false))
+    {
+        cpHits = 0; cpElapsed = 0; cpPos = -1;
+        for (int k = 0; k < kCurvePoints; ++k) cpAcc[k] = 0.0f;
+    }
 
     // parametros
     const int mode = (int) pMode->load();
-    const bool manual = pCurveMode->load() > 0.5f;
+    const int cm = (int) pCurveMode->load();
+    const bool manual = (cm == 2);
+    const bool follow = (cm == 1);
     const float amount = pAmount->load() * 0.01f;
     const float mix = pMix->load() * 0.01f;
     const float thr = Decibels::decibelsToGain (pThr->load());
@@ -273,6 +285,16 @@ void KickDuckProcessor::processBlock (AudioBuffer<float>& buffer, MidiBuffer& mi
     if (mode == 2)
         for (const auto m : midi)
             if (m.getMessage().isNoteOn() && nNotes < 64) noteOns[nNotes++] = m.samplePosition;
+
+    // seguir kick: envolvente + mapeo a profundidad
+    const float atkC = std::exp (-1.0f / (jmax (0.05f, pAttack->load()) * 0.001f * (float) sr));
+    const float relC = std::exp (-1.0f / (jmax (1.0f, pRelease->load()) * 0.001f * (float) sr));
+    const float thrDb = pThr->load();
+    const float rangeDb = jmap (pSens->load() * 0.01f, 30.0f, 6.0f);
+    const float smMs = pSmooth->load();
+    const float followSmooth = smMs < 0.05f ? 1.0f : 1.0f - std::exp (-1.0f / (smMs * 0.001f * (float) sr));
+    const float cpAtk = std::exp (-1.0f / (0.001f * (float) sr));
+    const float cpRel = std::exp (-1.0f / (0.020f * (float) sr));
 
     float blockPeak = 0.0f;
 
@@ -321,7 +343,13 @@ void KickDuckProcessor::processBlock (AudioBuffer<float>& buffer, MidiBuffer& mi
 
         // curva de ducking
         float depth = 0.0f;
-        if (t >= 0)
+        if (follow)
+        {
+            envF = a + (a > envF ? atkC : relC) * (envF - a);
+            const float db = Decibels::gainToDecibels (envF, -100.0f);
+            depth = jlimit (0.0f, 1.0f, (db - thrDb) / rangeDb);
+        }
+        else if (t >= 0)
         {
             if (manual)
             {
@@ -339,7 +367,36 @@ void KickDuckProcessor::processBlock (AudioBuffer<float>& buffer, MidiBuffer& mi
 
             if (++t >= totalLen) t = -1;
         }
-        depthSm += (depth - depthSm) * smoothCoef;
+        depthSm += (depth - depthSm) * (follow ? followSmooth : smoothCoef);
+
+        // copiar la forma del kick a la curva Manual
+        cpEnv = a + (a > cpEnv ? cpAtk : cpRel) * (cpEnv - a);
+        if (cpActive.load())
+        {
+            if (trig && cpPos < 0)
+            {
+                cpPos = 0; cpLen = jmax (1, rel);
+                for (float& b : cpBin) b = 0.0f;
+            }
+            if (cpPos >= 0)
+            {
+                const int bi = jmin (kCurvePoints - 1, (int) ((long long) cpPos * kCurvePoints / cpLen));
+                cpBin[bi] = jmax (cpBin[bi], cpEnv);
+                if (++cpPos >= cpLen)
+                {
+                    float mx = 0.0f;
+                    for (float b : cpBin) mx = jmax (mx, b);
+                    if (mx > 1.0e-4f)
+                    {
+                        for (int k = 0; k < kCurvePoints; ++k) cpAcc[k] += cpBin[k] / mx;
+                        copyHitsShown = ++cpHits;
+                    }
+                    cpPos = -1;
+                    if (cpHits >= 4) finishCopy();
+                }
+            }
+            if (cpActive.load() && ++cpElapsed > (int) (4.0 * sr)) finishCopy();
+        }
 
         // banda grave: all-pass + polaridad + ducking, con retardo del bajo
         float wetPre[2], out[2];
@@ -394,7 +451,7 @@ void KickDuckProcessor::processBlock (AudioBuffer<float>& buffer, MidiBuffer& mi
         // captura para auto-fase
         if (capActive.load())
         {
-            if (++capElapsed > (int) (6.0 * sr)) finishCapture();
+            if (++capElapsed > (int) (4.0 * sr)) finishCapture();
             else if (capWait > 0 && --capWait == 0) { storeCapturedSegment(); capWait = -1; }
         }
 
@@ -424,7 +481,8 @@ void KickDuckProcessor::storeCapturedSegment()
         mk = jmax (mk, std::abs (capKick[capCount][(size_t) k]));
     }
     if (mk < 1.0e-4f) return; // sin kick real: descartar
-    if (++capCount >= kMaxSegments) finishCapture();
+    capShown = ++capCount;
+    if (capCount >= kMaxSegments) finishCapture();
 }
 
 void KickDuckProcessor::finishCapture()
@@ -444,6 +502,11 @@ void KickDuckProcessor::requestAutoPhase()
 
 void KickDuckProcessor::pollAutoPhase()
 {
+    if (copyState.load() == 2)
+    {
+        if (auto* p = apvts.getParameter ("curveMode")) p->setValueNotifyingHost (p->convertTo0to1 (2.0f));
+        copyState = 4;
+    }
     if (autoState.load() == 2) startAutoPhaseSearch();
 }
 
@@ -504,10 +567,43 @@ String KickDuckProcessor::getAutoPhaseStatus() const
 {
     switch (autoState.load())
     {
-        case 1: return U8 ("Capturando kicks… deja sonar kick y bajo");
+        case 1: return U8 ("Captado ") + String (capShown.load()) + U8 (" de 4 · deja sonar kick y bajo");
         case 3: return U8 ("Analizando…");
         case 4: return U8 ("Listo · correlación ") + String (autoScore.load(), 2);
         case 5: return U8 ("Necesito kick y bajo sonando");
+        default: return {};
+    }
+}
+
+void KickDuckProcessor::finishCopy()
+{
+    cpActive = false;
+    float mx = 0.0f;
+    for (float v : cpAcc) mx = jmax (mx, v);
+    if (cpHits >= 1 && mx > 1.0e-4f)
+    {
+        for (int k = 0; k < kCurvePoints; ++k) curve[(size_t) k] = jlimit (0.0f, 1.0f, cpAcc[k] / mx);
+        copyState = 2;
+    }
+    else copyState = 3;
+}
+
+void KickDuckProcessor::requestCopyCurve()
+{
+    if (copyState.load() == 1) return;
+    copyHitsShown = 0;
+    cpReset = true;
+    cpActive = true;
+    copyState = 1;
+}
+
+String KickDuckProcessor::getCopyStatus() const
+{
+    switch (copyState.load())
+    {
+        case 1: return U8 ("Copiando kick ") + String (copyHitsShown.load()) + U8 (" de 4…");
+        case 3: return U8 ("Necesito el kick sonando");
+        case 4: return U8 ("Curva copiada · editable en Manual");
         default: return {};
     }
 }

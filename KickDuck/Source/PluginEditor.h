@@ -28,7 +28,7 @@ private:
     void setTab (int);
     void updateVisibility();
     void editCurve (const juce::MouseEvent&);
-    void addKnob (int idx, const char* paramId, const char* name);
+    void addKnob (int idx, const char* paramId, const char* name, const char* unit, int dec);
     void drawScope (juce::Graphics&, juce::Rectangle<float>);
     void drawCurveEditor (juce::Graphics&, juce::Rectangle<float>);
     void drawZoom (juce::Graphics&, juce::Rectangle<float>);
@@ -37,15 +37,16 @@ private:
     KickDuckProcessor& proc;
     int tab = 0;
     bool manualMode = false, noSignal = false;
+    int curveIdx = 0;
     juce::uint32 lastSignalMs = 0;
     juce::Rectangle<int> panel, corrPanel, knobRow;
 
-    juce::TextButton tabSide { "Sidechain" }, tabPhase { "Fase" }, autoBtn { "Auto-fase" }, undoBtn { "Deshacer" };
+    juce::TextButton tabSide { "Sidechain" }, tabPhase { "Fase" }, autoBtn { "Auto-fase" }, undoBtn { "Deshacer" }, copyBtn { "Copiar del kick" };
     juce::ComboBox modeBox, curveBox;
     juce::ToggleButton fullBtn { "Banda completa" }, polBtn { "Invertir polaridad" },
         lockPol { "Bloq. polaridad" }, lockPh { "Bloq. fase" }, lockDel { "Bloq. delay" };
 
-    enum { kAmount, kRelease, kThr, kMix, kAttack, kHold, kLp, kPhase, kDelay, kNumKnobs };
+    enum { kAmount, kRelease, kThr, kMix, kAttack, kHold, kLp, kPhase, kDelay, kSens, kSmooth, kNumKnobs };
     Knob knobs[kNumKnobs];
 
     std::unique_ptr<CA> modeAtt, curveAtt;

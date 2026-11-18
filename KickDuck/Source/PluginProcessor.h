@@ -92,6 +92,10 @@ public:
     void pollAutoPhase();
     juce::String getAutoPhaseStatus() const;
 
+    // --- Copiar curva del kick ---
+    void requestCopyCurve();
+    juce::String getCopyStatus() const;
+
     juce::AudioProcessorValueTreeState apvts;
 
     // Datos para la interfaz (escritos por el hilo de audio)
@@ -104,6 +108,9 @@ public:
     std::atomic<float> kickLevel { 0.0f };
     std::atomic<int> autoState { 0 }; // 0 libre,1 capturando,2 listo,3 buscando,4 ok,5 sin senal
     std::atomic<float> autoScore { 0.0f };
+    std::atomic<int> capShown { 0 };
+    std::atomic<int> copyState { 0 };     // 0 libre,1 copiando,2 listo,3 sin senal,4 aplicado
+    std::atomic<int> copyHitsShown { 0 };
 
 private:
     static juce::AudioProcessorValueTreeState::ParameterLayout createLayout();
@@ -112,13 +119,14 @@ private:
     void storeCapturedSegment();
     void finishCapture();
     void startAutoPhaseSearch();
+    void finishCopy();
 
     double sr = 44100.0;
     int lookaheadSamples = 0;
     int ringSize = 0;
 
     std::atomic<float> *pMode, *pCurveMode, *pAmount, *pRelease, *pThr, *pMix, *pAttack, *pHold,
-        *pLp, *pFull, *pPhase, *pDelay, *pPol;
+        *pLp, *pFull, *pPhase, *pDelay, *pPol, *pSens, *pSmooth;
 
     kd::Ring ringIn[2], ringKick, rawKick, rawBass;
     juce::dsp::LinkwitzRileyFilter<float> lr[2];
@@ -140,6 +148,12 @@ private:
     int corrWait = 0, corrLen = 0, winSamples = 0, zPos = 0;
     double sxy = 0, sxx = 0, syy = 0;
     std::vector<float> zk, zb;
+
+    // seguir kick y copiar curva
+    float envF = 0.0f, cpEnv = 0.0f;
+    int cpPos = -1, cpLen = 0, cpHits = 0, cpElapsed = 0;
+    float cpBin[kCurvePoints] {}, cpAcc[kCurvePoints] {};
+    std::atomic<bool> cpActive { false }, cpReset { false };
 
     // scope
     int spp = 1, scopeCount = 0;
