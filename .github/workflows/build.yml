@@ -1,0 +1,45 @@
+name: Build VST3
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            name: Windows
+          - os: macos-latest
+            name: macOS
+          - os: ubuntu-latest
+            name: Linux
+    runs-on: ${{ matrix.os }}
+    name: ${{ matrix.name }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Dependencias (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libasound2-dev libfreetype-dev libfontconfig1-dev \
+            libx11-dev libxrandr-dev libxinerama-dev libxcursor-dev libxext-dev libgl-dev
+
+      - name: Configurar
+
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DKICKDUCK_COPY=OFF -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64"
+
+      - name: Compilar
+        run: cmake --build build --config Release --target KickDuck_VST3 --parallel
+
+      - name: Subir VST3
+        uses: actions/upload-artifact@v4
+        with:
+          name: KickDuck-${{ matrix.name }}-VST3
+          path: |
+            build/KickDuck_artefacts/**/VST3/KickDuck.vst3
+          if-no-files-found: error
