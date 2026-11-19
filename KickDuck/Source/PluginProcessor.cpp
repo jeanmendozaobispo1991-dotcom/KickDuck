@@ -304,19 +304,26 @@ void KickDuckProcessor::processBlock (AudioBuffer<float>& buffer, MidiBuffer& mi
         in[0] = mainBus.getSample (0, i);
         in[1] = (nCh > 1) ? mainBus.getSample (1, i) : in[0];
 
+        if (! std::isfinite (in[0])) in[0] = 0.0f;
+        if (! std::isfinite (in[1])) in[1] = 0.0f;
+
         float sc = 0.0f;
         if (scCh > 0)
         {
             sc = scBus.getSample (0, i);
             if (scCh > 1) sc = 0.5f * (sc + scBus.getSample (1, i));
         }
+        if (! std::isfinite (sc)) sc = 0.0f;
         blockPeak = jmax (blockPeak, std::abs (sc));
 
         ringIn[0].push (in[0]);
         ringIn[1].push (in[1]);
         ringKick.push (sc);
-        rawKick.push (lpKickRaw.process (sc));
-        rawBass.push (lpBassRaw.process (0.5f * (in[0] + in[1])));
+        float rk = lpKickRaw.process (sc);
+        float rb = lpBassRaw.process (0.5f * (in[0] + in[1]));
+        if (! std::isfinite (rk) || ! std::isfinite (rb)) { resetDspState(); rk = rb = 0.0f; }
+        rawKick.push (rk);
+        rawBass.push (rb);
 
         // deteccion del kick
         const float a = std::abs (sc);
@@ -353,14 +360,14 @@ void KickDuckProcessor::processBlock (AudioBuffer<float>& buffer, MidiBuffer& mi
         {
             if (manual)
             {
-                const float x = (float) t / (float) totalLen * (float) (kCurvePoints - 1);
+                const float x = jmin ((float) (kCurvePoints - 1), (float) t / (float) totalLen * (float) (kCurvePoints - 1));
                 const int i0 = jlimit (0, kCurvePoints - 2, (int) x);
                 const float fr = x - (float) i0;
                 depth = curve[(size_t) i0].load() * (1.0f - fr) + curve[(size_t) i0 + 1].load() * fr;
             }
             else if (t < atk) depth = (float) t / (float) atk;
             else if (t < atk + hld) depth = 1.0f;
-            else depth = std::pow (1.0f - (float) (t - atk - hld) / (float) rel, 1.5f);
+            else depth = std::pow (jlimit (0.0f, 1.0f, 1.0f - (float) (t - atk - hld) / (float) rel), 1.5f);
 
             if (startDepth > 0.01f && t < carryLen)
                 depth = jmax (depth, startDepth * (1.0f - (float) t / (float) carryLen));
@@ -417,11 +424,19 @@ void KickDuckProcessor::processBlock (AudioBuffer<float>& buffer, MidiBuffer& mi
             wetPre[c] = y + high;
             out[c] = dry * (1.0f - mix) + (y * gain + high) * mix;
         }
+        if (! std::isfinite (out[0]) || ! std::isfinite (out[1]) || ! std::isfinite (depthSm))
+        {
+            resetDspState();
+            out[0] = ringIn[0].read (L);
+            out[1] = ringIn[1].read (L);
+            wetPre[0] = wetPre[1] = 0.0f;
+        }
         for (int c = 0; c < nCh; ++c) mainBus.setSample (c, i, out[c]);
 
         // correlacion kick/bajo en graves
-        const float kd = lpKickCorr.process (ringKick.read (L));
-        const float bd = lpBassCorr.process (0.5f * (wetPre[0] + wetPre[1]));
+        float kd = lpKickCorr.process (ringKick.read (L));
+        float bd = lpBassCorr.process (0.5f * (wetPre[0] + wetPre[1]));
+        if (! std::isfinite (kd) || ! std::isfinite (bd)) { lpKickCorr.reset(); lpBassCorr.reset(); kd = bd = 0.0f; }
         if (! corrIdle)
         {
             if (corrWait > 0) --corrWait;
@@ -468,6 +483,17 @@ void KickDuckProcessor::processBlock (AudioBuffer<float>& buffer, MidiBuffer& mi
         }
     }
     kickLevel = blockPeak;
+}
+
+void KickDuckProcessor::resetDspState()
+{
+    for (auto& f : lr) f.reset();
+    for (int c = 0; c < 2; ++c) apX[c] = apY[c] = 0.0f;
+    lpKickRaw.reset(); lpBassRaw.reset(); lpKickCorr.reset(); lpBassCorr.reset();
+    env = envF = cpEnv = 0.0f;
+    depthSm = startDepth = 0.0f;
+    t = -1;
+    armed = true;
 }
 
 void KickDuckProcessor::storeCapturedSegment()

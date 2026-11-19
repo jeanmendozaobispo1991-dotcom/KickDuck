@@ -120,6 +120,7 @@ private:
     void finishCapture();
     void startAutoPhaseSearch();
     void finishCopy();
+    void resetDspState();
 
     double sr = 44100.0;
     int lookaheadSamples = 0;
