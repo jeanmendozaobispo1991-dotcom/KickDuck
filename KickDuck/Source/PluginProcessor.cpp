@@ -22,7 +22,7 @@ void allpassCoef (float thetaDeg, float fc, double fs, float& a, bool& bypass, f
 struct SearchResult { bool ok = false; bool pol = false; float phase = 0, delayMs = 0, corr = 0; };
 
 SearchResult runSearch (const std::vector<std::vector<float>>& K, const std::vector<std::vector<float>>& B,
-                        double fs, float fc, int pad, bool lockPol, bool curPol, bool lockPh, float curPhase,
+                        double fs, float fc, int pad, int start, bool lockPol, bool curPol, bool lockPh, float curPhase,
                         bool lockDel, float curDelay, float dMinMs, float dMaxMs)
 {
     SearchResult r;
@@ -67,7 +67,7 @@ SearchResult runSearch (const std::vector<std::vector<float>>& K, const std::vec
             for (size_t k = 0; k < K.size(); ++k)
             {
                 const int len = (int) K[k].size();
-                for (int i = pad; i < len; ++i)
+                for (int i = start; i < len; ++i)
                 {
                     const int j = i - s;
                     if (j < 0 || j >= len) continue;
@@ -208,7 +208,9 @@ void KickDuckProcessor::prepareToPlay (double sampleRate, int samplesPerBlock)
     t = -1; startDepth = depthSm = 0.0f;
     smoothCoef = 1.0f - std::exp (-1.0f / (0.0003f * (float) sr));
 
-    winSamples = (int) (0.040 * sr);
+    winSamples = (int) (0.050 * sr);
+    tailSkip = (int) (0.020 * sr);
+    wasSplit = false;
     corrIdle = true;
     zk.assign ((size_t) kZoomPoints, 0.0f);
     zb.assign ((size_t) kZoomPoints, 0.0f);
@@ -217,7 +219,7 @@ void KickDuckProcessor::prepareToPlay (double sampleRate, int samplesPerBlock)
     scopeCount = 0; pkKick = pkBass = pkDepth = 0.0f;
 
     capPad = (int) (0.010 * sr);
-    capAfter = (int) (0.060 * sr);
+    capAfter = (int) (0.070 * sr);
     capLen = capPad + capAfter;
     for (int k = 0; k < kMaxSegments; ++k)
     {
@@ -240,7 +242,13 @@ void KickDuckProcessor::processBlock (AudioBuffer<float>& buffer, MidiBuffer& mi
     const int scCh = scBus.getNumChannels();
     if (nCh == 0) return;
 
-    if (capReset.exchange (false)) { capCount = 0; capElapsed = 0; capWait = -1; capShown = 0; }
+    if (capReset.exchange (false))
+    {
+        capCount = 0; capElapsed = 0; capWait = -1; capShown = 0;
+        std::fill (rawKick.d.begin(), rawKick.d.end(), 0.0f);
+        std::fill (rawBass.d.begin(), rawBass.d.end(), 0.0f);
+        lpKickRaw.reset(); lpBassRaw.reset();
+    }
     if (cpReset.exchange (false))
     {
         cpHits = 0; cpElapsed = 0; cpPos = -1;
@@ -265,6 +273,24 @@ void KickDuckProcessor::processBlock (AudioBuffer<float>& buffer, MidiBuffer& mi
     float apA; bool apBypass; float apSign;
     allpassCoef (pPhase->load(), lp, sr, apA, apBypass, apSign);
     const float polSign = (pol ? -1.0f : 1.0f) * apSign;
+
+    // el cruce solo trabaja si hace falta (rotacion/polaridad o ducking solo en graves)
+    const bool rotating = ! apBypass || polSign < 0.0f;
+    const bool needSplit = ! full || rotating;
+    if (needSplit && ! wasSplit)
+    {
+        // calentar el cruce con el historial reciente para que no haya salto al activarlo
+        constexpr int warmN = 1024;
+        for (int k = warmN; k >= 1; --k)
+            for (int c = 0; c < 2; ++c)
+            {
+                float lo, hi;
+                lr[c].processSample (c, ringIn[c].read (jmin (ringSize - 2, wetDelay + k)), lo, hi);
+                if (! apBypass) { apY[c] = apA * lo + apX[c] - apA * apY[c]; apX[c] = lo; }
+                else apX[c] = apY[c] = lo;
+            }
+    }
+    wasSplit = needSplit;
 
     if (lp != lastLp)
     {
@@ -296,22 +322,26 @@ void KickDuckProcessor::processBlock (AudioBuffer<float>& buffer, MidiBuffer& mi
     const float cpAtk = std::exp (-1.0f / (0.001f * (float) sr));
     const float cpRel = std::exp (-1.0f / (0.020f * (float) sr));
 
+    float* mp[2] = { mainBus.getWritePointer (0), nCh > 1 ? mainBus.getWritePointer (1) : nullptr };
+    const float* sp0 = scCh > 0 ? scBus.getReadPointer (0) : nullptr;
+    const float* sp1 = scCh > 1 ? scBus.getReadPointer (1) : nullptr;
+
     float blockPeak = 0.0f;
 
     for (int i = 0; i < n; ++i)
     {
         float in[2];
-        in[0] = mainBus.getSample (0, i);
-        in[1] = (nCh > 1) ? mainBus.getSample (1, i) : in[0];
+        in[0] = mp[0][i];
+        in[1] = mp[1] != nullptr ? mp[1][i] : in[0];
 
         if (! std::isfinite (in[0])) in[0] = 0.0f;
         if (! std::isfinite (in[1])) in[1] = 0.0f;
 
         float sc = 0.0f;
-        if (scCh > 0)
+        if (sp0 != nullptr)
         {
-            sc = scBus.getSample (0, i);
-            if (scCh > 1) sc = 0.5f * (sc + scBus.getSample (1, i));
+            sc = sp0[i];
+            if (sp1 != nullptr) sc = 0.5f * (sc + sp1[i]);
         }
         if (! std::isfinite (sc)) sc = 0.0f;
         blockPeak = jmax (blockPeak, std::abs (sc));
@@ -319,11 +349,14 @@ void KickDuckProcessor::processBlock (AudioBuffer<float>& buffer, MidiBuffer& mi
         ringIn[0].push (in[0]);
         ringIn[1].push (in[1]);
         ringKick.push (sc);
-        float rk = lpKickRaw.process (sc);
-        float rb = lpBassRaw.process (0.5f * (in[0] + in[1]));
-        if (! std::isfinite (rk) || ! std::isfinite (rb)) { resetDspState(); rk = rb = 0.0f; }
-        rawKick.push (rk);
-        rawBass.push (rb);
+        if (capActive.load())
+        {
+            float rk = lpKickRaw.process (sc);
+            float rb = lpBassRaw.process (0.5f * (in[0] + in[1]));
+            if (! std::isfinite (rk) || ! std::isfinite (rb)) { resetDspState(); rk = rb = 0.0f; }
+            rawKick.push (rk);
+            rawBass.push (rb);
+        }
 
         // deteccion del kick
         const float a = std::abs (sc);
@@ -344,7 +377,7 @@ void KickDuckProcessor::processBlock (AudioBuffer<float>& buffer, MidiBuffer& mi
         {
             startDepth = depthSm;
             t = 0;
-            if (corrIdle) { corrIdle = false; corrWait = L; corrLen = winSamples; sxy = sxx = syy = 0; zPos = 0; }
+            if (corrIdle) { corrIdle = false; corrWait = L + tailSkip; corrLen = winSamples; sxy = sxx = syy = 0; zPos = 0; }
             if (capActive.load() && capWait < 0) capWait = capAfter;
         }
 
@@ -367,7 +400,7 @@ void KickDuckProcessor::processBlock (AudioBuffer<float>& buffer, MidiBuffer& mi
             }
             else if (t < atk) depth = (float) t / (float) atk;
             else if (t < atk + hld) depth = 1.0f;
-            else depth = std::pow (jlimit (0.0f, 1.0f, 1.0f - (float) (t - atk - hld) / (float) rel), 1.5f);
+            else { const float u = jlimit (0.0f, 1.0f, 1.0f - (float) (t - atk - hld) / (float) rel); depth = u * std::sqrt (u); }
 
             if (startDepth > 0.01f && t < carryLen)
                 depth = jmax (depth, startDepth * (1.0f - (float) t / (float) carryLen));
@@ -413,16 +446,17 @@ void KickDuckProcessor::processBlock (AudioBuffer<float>& buffer, MidiBuffer& mi
             const float x = ringIn[c].read (wetDelay);
             const float dry = ringIn[c].read (L);
             float low = x, high = 0.0f;
-            if (! full) lr[c].processSample (c, x, low, high);
+            if (needSplit) lr[c].processSample (c, x, low, high);
             float y = low;
             if (! apBypass)
             {
                 y = apA * low + apX[c] - apA * apY[c];
                 apX[c] = low; apY[c] = y;
             }
+            else if (needSplit) apX[c] = apY[c] = low;
             y *= polSign;
             wetPre[c] = y + high;
-            out[c] = dry * (1.0f - mix) + (y * gain + high) * mix;
+            out[c] = dry * (1.0f - mix) + (y * gain + high * (full ? gain : 1.0f)) * mix;
         }
         if (! std::isfinite (out[0]) || ! std::isfinite (out[1]) || ! std::isfinite (depthSm))
         {
@@ -431,7 +465,7 @@ void KickDuckProcessor::processBlock (AudioBuffer<float>& buffer, MidiBuffer& mi
             out[1] = ringIn[1].read (L);
             wetPre[0] = wetPre[1] = 0.0f;
         }
-        for (int c = 0; c < nCh; ++c) mainBus.setSample (c, i, out[c]);
+        for (int c = 0; c < nCh; ++c) mp[c][i] = out[c];
 
         // correlacion kick/bajo en graves
         float kd = lpKickCorr.process (ringKick.read (L));
@@ -494,6 +528,7 @@ void KickDuckProcessor::resetDspState()
     depthSm = startDepth = 0.0f;
     t = -1;
     armed = true;
+    wasSplit = false;
 }
 
 void KickDuckProcessor::storeCapturedSegment()
@@ -546,6 +581,7 @@ void KickDuckProcessor::startAutoPhaseSearch()
     const double fs = sr;
     const float fc = pLp->load();
     const int pad = capPad;
+    const int start = capPad + tailSkip;
     const bool lockPol = apvts.getRawParameterValue ("lockPol")->load() > 0.5f;
     const bool lockPh = apvts.getRawParameterValue ("lockPhase")->load() > 0.5f;
     const bool lockDel = apvts.getRawParameterValue ("lockDelay")->load() > 0.5f;
@@ -554,9 +590,9 @@ void KickDuckProcessor::startAutoPhaseSearch()
     const float dMin = ((int) pMode->load() == 0) ? -kLookaheadMs : 0.0f;
     auto aliveCopy = alive;
 
-    Thread::launch ([this, aliveCopy, K, B, fs, fc, pad, lockPol, curPol, lockPh, curPhase, lockDel, curDelay, dMin]
+    Thread::launch ([this, aliveCopy, K, B, fs, fc, pad, start, lockPol, curPol, lockPh, curPhase, lockDel, curDelay, dMin]
     {
-        const auto r = runSearch (K, B, fs, fc, pad, lockPol, curPol, lockPh, curPhase, lockDel, curDelay, dMin, 20.0f);
+        const auto r = runSearch (K, B, fs, fc, pad, start, lockPol, curPol, lockPh, curPhase, lockDel, curDelay, dMin, 20.0f);
         MessageManager::callAsync ([this, aliveCopy, r, curPol, curPhase, curDelay]
         {
             if (! aliveCopy->load()) return;

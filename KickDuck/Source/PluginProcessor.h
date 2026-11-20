@@ -153,6 +153,8 @@ private:
     // seguir kick y copiar curva
     float envF = 0.0f, cpEnv = 0.0f;
     int cpPos = -1, cpLen = 0, cpHits = 0, cpElapsed = 0;
+    bool wasSplit = false;
+    int tailSkip = 0;
     float cpBin[kCurvePoints] {}, cpAcc[kCurvePoints] {};
     std::atomic<bool> cpActive { false }, cpReset { false };
 

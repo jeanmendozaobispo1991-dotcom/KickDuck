@@ -10,7 +10,9 @@ const Colour kBg (0xff0e0e12), kPanel (0xff16161c), kOrange (0xffff5a2a), kCream
 
 KickDuckEditor::KickDuckEditor (KickDuckProcessor& p) : AudioProcessorEditor (&p), proc (p)
 {
+    setOpaque (true);
     setSize (1000, 640);
+    pCurve = proc.apvts.getRawParameterValue ("curveMode");
 
     for (auto* b : { &tabSide, &tabPhase })
     {
@@ -178,9 +180,20 @@ void KickDuckEditor::timerCallback()
     if (proc.kickLevel.load() > 1.0e-4f) lastSignalMs = now;
     noSignal = (now - lastSignalMs) > 1500;
 
-    const int ci = (int) proc.apvts.getRawParameterValue ("curveMode")->load();
-    if (ci != curveIdx) { updateVisibility(); resized(); }
-    repaint();
+    const int ci = (int) pCurve->load();
+    if (ci != curveIdx) { updateVisibility(); resized(); repaint(); return; }
+
+    const String st = (tab == 0) ? proc.getCopyStatus() : proc.getAutoPhaseStatus();
+    const int lat = proc.getLatencySamples();
+    const bool full = (noSignal != lastNoSignal) || (st != lastStatus) || (lat != lastLatency);
+    lastNoSignal = noSignal; lastStatus = st; lastLatency = lat;
+
+    if (full) repaint();
+    else
+    {
+        repaint (panel);
+        if (tab == 1) repaint (corrPanel);
+    }
 }
 
 void KickDuckEditor::editCurve (const MouseEvent& e)
@@ -334,7 +347,7 @@ void KickDuckEditor::paint (Graphics& g)
         g.setFont (Font (FontOptions (12.0f)));
         g.setColour (kOrange); g.drawText (U8 ("● Kick (graves)"), panel.getX() + 14, panel.getY() + 4, 120, 16, Justification::left);
         g.setColour (kCream);  g.drawText (U8 ("● Bajo (graves)"), panel.getX() + 134, panel.getY() + 4, 120, 16, Justification::left);
-        g.setColour (kMuted);  g.drawText ("Zoom 0-40 ms", panel.getRight() - 134, panel.getY() + 4, 120, 16, Justification::right);
+        g.setColour (kMuted);  g.drawText ("Zoom 20-70 ms", panel.getRight() - 134, panel.getY() + 4, 120, 16, Justification::right);
 
         g.setColour (kPanel);
         g.fillRoundedRectangle (corrPanel.toFloat(), 12.0f);

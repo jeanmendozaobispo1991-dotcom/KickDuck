@@ -37,7 +37,10 @@ private:
     KickDuckProcessor& proc;
     int tab = 0;
     bool manualMode = false, noSignal = false;
-    int curveIdx = 0;
+    int curveIdx = 0, lastLatency = -1;
+    bool lastNoSignal = false;
+    juce::String lastStatus;
+    std::atomic<float>* pCurve = nullptr;
     juce::uint32 lastSignalMs = 0;
     juce::Rectangle<int> panel, corrPanel, knobRow;
 
