@@ -80,11 +80,13 @@ SearchResult runSearch (const std::vector<std::vector<float>>& K, const std::vec
             {
                 const bool pol = (p == 1);
                 if (lockPol && pol != curPol) continue;
-                const float score = pol ? -c : c;
+                const float cc = pol ? -c : c;
+                const float ms = (float) s * 1000.0f / (float) fs;
+                const float score = cc - 0.004f * std::abs (ms);   // preferir el ajuste mas pequeno
                 if (score > best)
                 {
                     best = score; r.ok = true; r.pol = pol; r.phase = theta;
-                    r.delayMs = (float) s * 1000.0f / (float) fs; r.corr = score;
+                    r.delayMs = ms; r.corr = cc;
                 }
             }
         }
@@ -113,6 +115,8 @@ AudioProcessorValueTreeState::ParameterLayout KickDuckProcessor::createLayout()
     p.push_back (F ("hold", "Hold", { 0.0f, 100.0f, 0.1f }, 5.0f, " ms"));
     p.push_back (F ("sens", "Sensibilidad", { 0.0f, 100.0f, 0.1f }, 70.0f, " %"));
     p.push_back (F ("smooth", "Suavizado", { 0.0f, 50.0f, 0.1f }, 5.0f, " ms"));
+    p.push_back (std::make_unique<AudioParameterChoice> (ParameterID { "scopeWin", 1 }, "Ventana",
+                 StringArray { "Ventana 1.5 s", "Ventana 3 s", "Ventana 6 s" }, 1));
     p.push_back (F ("lpFreq", "Graves LP", { 40.0f, 500.0f, 1.0f, 0.5f }, 150.0f, " Hz"));
     p.push_back (std::make_unique<AudioParameterBool> (ParameterID { "fullBand", 1 }, "Banda completa", true));
     p.push_back (F ("phase", "Fase", { 0.0f, 180.0f, 0.1f }, 0.0f, U8 ("°").toRawUTF8()));
@@ -146,6 +150,7 @@ KickDuckProcessor::KickDuckProcessor()
     pPol = apvts.getRawParameterValue ("polarity");
     pSens = apvts.getRawParameterValue ("sens");
     pSmooth = apvts.getRawParameterValue ("smooth");
+    pScopeWin = apvts.getRawParameterValue ("scopeWin");
 
     for (int i = 0; i < kCurvePoints; ++i)
         curve[(size_t) i] = std::pow (1.0f - (float) i / (float) (kCurvePoints - 1), 1.5f);
@@ -211,6 +216,9 @@ void KickDuckProcessor::prepareToPlay (double sampleRate, int samplesPerBlock)
     winSamples = (int) (0.050 * sr);
     tailSkip = (int) (0.020 * sr);
     wasSplit = false;
+    appInit = false; pendingCount = 0;
+    lpBassOrig.reset();
+    zo.assign ((size_t) kZoomPoints, 0.0f);
     corrIdle = true;
     zk.assign ((size_t) kZoomPoints, 0.0f);
     zb.assign ((size_t) kZoomPoints, 0.0f);
@@ -265,31 +273,42 @@ void KickDuckProcessor::processBlock (AudioBuffer<float>& buffer, MidiBuffer& mi
     const float thr = Decibels::decibelsToGain (pThr->load());
     const float lp = pLp->load();
     const bool full = pFull->load() > 0.5f;
-    const bool pol = pPol->load() > 0.5f;
     const int L = (mode == 0) ? lookaheadSamples : 0;
-    const int dSamp = roundToInt (pDelay->load() * (float) sr / 1000.0f);
-    const int wetDelay = jlimit (0, ringSize - 2, L + dSamp);
 
-    float apA; bool apBypass; float apSign;
-    allpassCoef (pPhase->load(), lp, sr, apA, apBypass, apSign);
-    const float polSign = (pol ? -1.0f : 1.0f) * apSign;
+    const int winIdx = (int) pScopeWin->load();
+    const int newSpp = jmax (1, (int) ((winIdx == 0 ? 1.5 : winIdx == 1 ? 3.0 : 6.0) * sr / kScopePoints));
+    if (newSpp != spp) { spp = newSpp; scopeCount = 0; }
+
+    // fase, delay y polaridad: los cambios se aplican solo con el bajo cerrado por el ducking
+    const bool tgtPol = pPol->load() > 0.5f;
+    const float tgtPhase = pPhase->load(), tgtDelay = pDelay->load();
+    if (! appInit) { appPhase = tgtPhase; appDelayMs = tgtDelay; appPol = tgtPol; appInit = true; }
+    bool differs = ! exactlyEqual (tgtPhase, appPhase) || ! exactlyEqual (tgtDelay, appDelayMs) || tgtPol != appPol;
+    if (differs && amount < 0.5f)
+    {
+        appPhase = tgtPhase; appDelayMs = tgtDelay; appPol = tgtPol; differs = false;
+    }
+    if (! differs) pendingCount = 0;
+    recomputeApplied (lp, L);
+    const int forceSamples = (int) (1.5 * sr);
 
     // el cruce solo trabaja si hace falta (rotacion/polaridad o ducking solo en graves)
-    const bool rotating = ! apBypass || polSign < 0.0f;
-    const bool needSplit = ! full || rotating;
-    if (needSplit && ! wasSplit)
+    auto splitNeeded = [this, full] { return ! full || ! apBypass || polSign < 0.0f; };
+    auto warmSplit = [this]
     {
         // calentar el cruce con el historial reciente para que no haya salto al activarlo
         constexpr int warmN = 1024;
         for (int k = warmN; k >= 1; --k)
-            for (int c = 0; c < 2; ++c)
+            for (int ch = 0; ch < 2; ++ch)
             {
                 float lo, hi;
-                lr[c].processSample (c, ringIn[c].read (jmin (ringSize - 2, wetDelay + k)), lo, hi);
-                if (! apBypass) { apY[c] = apA * lo + apX[c] - apA * apY[c]; apX[c] = lo; }
-                else apX[c] = apY[c] = lo;
+                lr[ch].processSample (ch, ringIn[ch].read (jmin (ringSize - 2, wetDelay + k)), lo, hi);
+                if (! apBypass) { apY[ch] = apA * lo + apX[ch] - apA * apY[ch]; apX[ch] = lo; }
+                else apX[ch] = apY[ch] = lo;
             }
-    }
+    };
+    bool needSplit = splitNeeded();
+    if (needSplit && ! wasSplit) warmSplit();
     wasSplit = needSplit;
 
     if (lp != lastLp)
@@ -297,7 +316,7 @@ void KickDuckProcessor::processBlock (AudioBuffer<float>& buffer, MidiBuffer& mi
         lastLp = lp;
         for (auto& f : lr) f.setCutoffFrequency (lp);
         lpKickRaw.setLowpass (sr, lp); lpBassRaw.setLowpass (sr, lp);
-        lpKickCorr.setLowpass (sr, lp); lpBassCorr.setLowpass (sr, lp);
+        lpKickCorr.setLowpass (sr, lp); lpBassCorr.setLowpass (sr, lp); lpBassOrig.setLowpass (sr, lp);
     }
 
     const int atk = jmax (1, (int) (pAttack->load() * 0.001f * (float) sr));
@@ -438,6 +457,19 @@ void KickDuckProcessor::processBlock (AudioBuffer<float>& buffer, MidiBuffer& mi
             if (cpActive.load() && ++cpElapsed > (int) (4.0 * sr)) finishCopy();
         }
 
+        if (differs)
+        {
+            if (depthSm >= 0.9f || ++pendingCount > forceSamples)
+            {
+                appPhase = tgtPhase; appDelayMs = tgtDelay; appPol = tgtPol;
+                differs = false; pendingCount = 0;
+                recomputeApplied (lp, L);
+                needSplit = splitNeeded();
+                if (needSplit && ! wasSplit) warmSplit();
+                wasSplit = needSplit;
+            }
+        }
+
         // banda grave: all-pass + polaridad + ducking, con retardo del bajo
         float wetPre[2], out[2];
         const float gain = 1.0f - depthSm * amount;
@@ -467,10 +499,14 @@ void KickDuckProcessor::processBlock (AudioBuffer<float>& buffer, MidiBuffer& mi
         }
         for (int c = 0; c < nCh; ++c) mp[c][i] = out[c];
 
-        // correlacion kick/bajo en graves
+        // medicion kick/bajo en graves (cola del kick)
         float kd = lpKickCorr.process (ringKick.read (L));
         float bd = lpBassCorr.process (0.5f * (wetPre[0] + wetPre[1]));
-        if (! std::isfinite (kd) || ! std::isfinite (bd)) { lpKickCorr.reset(); lpBassCorr.reset(); kd = bd = 0.0f; }
+        float bo = lpBassOrig.process (0.5f * (ringIn[0].read (L) + ringIn[1].read (L)));
+        if (! std::isfinite (kd) || ! std::isfinite (bd) || ! std::isfinite (bo))
+        {
+            lpKickCorr.reset(); lpBassCorr.reset(); lpBassOrig.reset(); kd = bd = bo = 0.0f;
+        }
         if (! corrIdle)
         {
             if (corrWait > 0) --corrWait;
@@ -478,26 +514,32 @@ void KickDuckProcessor::processBlock (AudioBuffer<float>& buffer, MidiBuffer& mi
             {
                 sxy += (double) kd * bd; sxx += (double) kd * kd; syy += (double) bd * bd;
                 const int zi = jmin (kZoomPoints - 1, zPos * kZoomPoints / jmax (1, winSamples));
-                zk[(size_t) zi] = kd; zb[(size_t) zi] = bd;
+                zk[(size_t) zi] = kd; zb[(size_t) zi] = bd; zo[(size_t) zi] = bo;
                 ++zPos;
                 if (--corrLen <= 0)
                 {
-                    if (sxx > 1e-9)
+                    if (sxx > 1e-9 && ! freeze.load())
                     {
-                        const float c = (float) (sxy / std::sqrt (sxx * syy + 1e-20));
-                        correlation = 0.5f * correlation.load() + 0.5f * c;
+                        const float cr = (float) (sxy / std::sqrt (sxx * syy + 1e-20));
+                        correlation = 0.5f * correlation.load() + 0.5f * cr;
+                        const float ratio = (float) ((sxx + syy + 2.0 * sxy) / (sxx + syy + 1.0e-20));
+                        sumDb = 0.5f * sumDb.load() + 0.5f * 10.0f * std::log10 (jmax (ratio, 1.0e-3f));
                         corrValid = true;
-                        float mk = 1e-6f, mb = 1e-6f;
-                        for (int k = 0; k < kZoomPoints; ++k) { mk = jmax (mk, std::abs (zk[(size_t) k])); mb = jmax (mb, std::abs (zb[(size_t) k])); }
-                        const float m = jmax (mk, mb);
-                        for (int k = 0; k < kZoomPoints; ++k) { zoomKick[(size_t) k] = zk[(size_t) k] / m; zoomBass[(size_t) k] = zb[(size_t) k] / m; }
+                        float m = 1.0e-6f;
+                        for (int k = 0; k < kZoomPoints; ++k)
+                            m = jmax (m, std::abs (zk[(size_t) k]), std::abs (zb[(size_t) k]), std::abs (zo[(size_t) k]));
+                        for (int k = 0; k < kZoomPoints; ++k)
+                        {
+                            zoomKick[(size_t) k] = zk[(size_t) k] / m;
+                            zoomBass[(size_t) k] = zb[(size_t) k] / m;
+                            zoomBassOrig[(size_t) k] = zo[(size_t) k] / m;
+                        }
                     }
                     corrIdle = true;
                 }
             }
         }
 
-        // captura para auto-fase
         if (capActive.load())
         {
             if (++capElapsed > (int) (4.0 * sr)) finishCapture();
@@ -510,13 +552,23 @@ void KickDuckProcessor::processBlock (AudioBuffer<float>& buffer, MidiBuffer& mi
         pkDepth = jmax (pkDepth, depthSm);
         if (++scopeCount >= spp)
         {
-            const int pos = scopePos.load();
-            scopeKick[(size_t) pos] = pkKick; scopeBass[(size_t) pos] = pkBass; scopeDepth[(size_t) pos] = pkDepth;
-            scopePos = (pos + 1) % kScopePoints;
+            if (! freeze.load())
+            {
+                const int pos = scopePos.load();
+                scopeKick[(size_t) pos] = pkKick; scopeBass[(size_t) pos] = pkBass; scopeDepth[(size_t) pos] = pkDepth;
+                scopePos = (pos + 1) % kScopePoints;
+            }
             scopeCount = 0; pkKick = pkBass = pkDepth = 0.0f;
         }
     }
     kickLevel = blockPeak;
+}
+
+void KickDuckProcessor::recomputeApplied (float lp, int L)
+{
+    allpassCoef (appPhase, lp, sr, apA, apBypass, apSign);
+    polSign = (appPol ? -1.0f : 1.0f) * apSign;
+    wetDelay = jlimit (0, ringSize - 2, L + roundToInt (appDelayMs * (float) sr / 1000.0f));
 }
 
 void KickDuckProcessor::resetDspState()
@@ -529,6 +581,8 @@ void KickDuckProcessor::resetDspState()
     t = -1;
     armed = true;
     wasSplit = false;
+    pendingCount = 0;
+    lpBassOrig.reset();
 }
 
 void KickDuckProcessor::storeCapturedSegment()
@@ -555,7 +609,7 @@ void KickDuckProcessor::finishCapture()
 void KickDuckProcessor::requestAutoPhase()
 {
     const int s = autoState.load();
-    if (s == 1 || s == 3) return;
+    if (s == 1 || s == 3 || s == 6) return;
     capReset = true;
     capActive = true;
     autoState = 1;
@@ -563,6 +617,8 @@ void KickDuckProcessor::requestAutoPhase()
 
 void KickDuckProcessor::pollAutoPhase()
 {
+    if (autoState.load() == 6 && anim.active && Time::getMillisecondCounter() - anim.startMs >= (uint32) kAnimMs)
+        commitAutoPhase();
     if (copyState.load() == 2)
     {
         if (auto* p = apvts.getParameter ("curveMode")) p->setValueNotifyingHost (p->convertTo0to1 (2.0f));
@@ -587,28 +643,52 @@ void KickDuckProcessor::startAutoPhaseSearch()
     const bool lockDel = apvts.getRawParameterValue ("lockDelay")->load() > 0.5f;
     const bool curPol = pPol->load() > 0.5f;
     const float curPhase = pPhase->load(), curDelay = pDelay->load();
-    const float dMin = ((int) pMode->load() == 0) ? -kLookaheadMs : 0.0f;
+    const float dMin = ((int) pMode->load() == 0) ? -5.0f : 0.0f;
     auto aliveCopy = alive;
 
     Thread::launch ([this, aliveCopy, K, B, fs, fc, pad, start, lockPol, curPol, lockPh, curPhase, lockDel, curDelay, dMin]
     {
-        const auto r = runSearch (K, B, fs, fc, pad, start, lockPol, curPol, lockPh, curPhase, lockDel, curDelay, dMin, 20.0f);
-        MessageManager::callAsync ([this, aliveCopy, r, curPol, curPhase, curDelay]
+        const auto r = runSearch (K, B, fs, fc, pad, start, lockPol, curPol, lockPh, curPhase, lockDel, curDelay, dMin, 5.0f);
+
+        size_t bi = 0;
+        double be = -1.0;
+        for (size_t k = 0; k < K.size(); ++k)
+        {
+            double e = 0.0;
+            for (float v : K[k]) e += (double) v * v;
+            if (e > be) { be = e; bi = k; }
+        }
+        const auto kBest = K[bi];
+        const auto bBest = B[bi];
+
+        MessageManager::callAsync ([this, aliveCopy, r, curPol, curPhase, curDelay, fs, fc, start, kBest, bBest]
         {
             if (! aliveCopy->load()) return;
             if (! r.ok) { autoState = 5; return; }
-            undo = { true, curPol ? 1.0f : 0.0f, curPhase, curDelay };
-            auto setP = [this] (const char* id, float v)
-            {
-                if (auto* p = apvts.getParameter (id)) p->setValueNotifyingHost (p->convertTo0to1 (v));
-            };
-            setP ("polarity", r.pol ? 1.0f : 0.0f);
-            setP ("phase", r.phase);
-            setP ("delay", r.delayMs);
+            anim.active = true;
+            anim.startMs = Time::getMillisecondCounter();
+            anim.pol0 = curPol ? 1.0f : 0.0f; anim.ph0 = curPhase; anim.d0 = curDelay;
+            anim.pol1 = r.pol ? 1.0f : 0.0f;  anim.ph1 = r.phase;  anim.d1 = r.delayMs;
+            anim.fc = fc; anim.fs = fs; anim.start = start;
+            anim.k = kBest; anim.b = bBest;
             autoScore = r.corr;
-            autoState = 4;
+            autoState = 6;
         });
     });
+}
+
+void KickDuckProcessor::commitAutoPhase()
+{
+    auto setP = [this] (const char* id, float v)
+    {
+        if (auto* p = apvts.getParameter (id)) p->setValueNotifyingHost (p->convertTo0to1 (v));
+    };
+    undo = { true, anim.pol0, anim.ph0, anim.d0 };
+    setP ("polarity", anim.pol1);
+    setP ("phase", anim.ph1);
+    setP ("delay", anim.d1);
+    anim.active = false;
+    autoState = 4;
 }
 
 void KickDuckProcessor::undoAutoPhase()
@@ -633,6 +713,7 @@ String KickDuckProcessor::getAutoPhaseStatus() const
         case 3: return U8 ("Analizando…");
         case 4: return U8 ("Listo · correlación ") + String (autoScore.load(), 2);
         case 5: return U8 ("Necesito kick y bajo sonando");
+        case 6: return U8 ("Alineando… mira la ventana de arriba");
         default: return {};
     }
 }

@@ -34,6 +34,14 @@ KickDuckEditor::KickDuckEditor (KickDuckProcessor& p) : AudioProcessorEditor (&p
     addAndMakeVisible (curveBox);
     modeAtt = std::make_unique<CA> (proc.apvts, "mode", modeBox);
     curveAtt = std::make_unique<CA> (proc.apvts, "curveMode", curveBox);
+    if (auto* c = dynamic_cast<AudioParameterChoice*> (proc.apvts.getParameter ("scopeWin")))
+        winBox.addItemList (c->choices, 1);
+    addAndMakeVisible (winBox);
+    winAtt = std::make_unique<CA> (proc.apvts, "scopeWin", winBox);
+    freezeBtn.setColour (ToggleButton::textColourId, kCream);
+    freezeBtn.setColour (ToggleButton::tickColourId, kOrange);
+    freezeBtn.onClick = [this] { proc.freeze = freezeBtn.getToggleState(); };
+    addAndMakeVisible (freezeBtn);
 
     addKnob (kAmount, "amount", "Amount", " %", 0);
     addKnob (kRelease, "release", "Release", " ms", 0);
@@ -116,6 +124,7 @@ void KickDuckEditor::updateVisibility()
     show (kMix, true); show (kLp, true);
     show (kPhase, ! side); show (kDelay, ! side);
     curveBox.setVisible (side);
+    winBox.setVisible (side);
     fullBtn.setVisible (side);
     polBtn.setVisible (! side); lockPol.setVisible (! side); lockPh.setVisible (! side);
     lockDel.setVisible (! side); autoBtn.setVisible (! side); undoBtn.setVisible (! side);
@@ -130,6 +139,10 @@ void KickDuckEditor::resized()
     modeBox.setBounds (top.removeFromRight (170).withHeight (36));
     top.removeFromRight (12);
     curveBox.setBounds (top.removeFromRight (110).withHeight (36));
+    top.removeFromRight (8);
+    winBox.setBounds (top.removeFromRight (120).withHeight (36));
+    top.removeFromRight (8);
+    freezeBtn.setBounds (top.removeFromRight (100).withHeight (36));
 
     r.removeFromTop (12);
     const int panelH = (tab == 0) ? 300 : 230;
@@ -258,52 +271,137 @@ void KickDuckEditor::drawZoom (Graphics& g, Rectangle<float> b)
 {
     const int N = KickDuckProcessor::kZoomPoints;
     const float cy = b.getCentreY(), hh = b.getHeight() * 0.45f;
-    Path pk, pb;
+    // las ondas se acercan poco a poco a cada nueva medicion, sin saltos bruscos
+    for (int i = 0; i < N; ++i)
+    {
+        const float tk = proc.zoomKick[(size_t) i].load();
+        const float tb = proc.zoomBass[(size_t) i].load();
+        const float to = proc.zoomBassOrig[(size_t) i].load();
+        if (! dispInit) { dk[(size_t) i] = tk; dbs[(size_t) i] = tb; dor[(size_t) i] = to; }
+        else
+        {
+            dk[(size_t) i] += 0.12f * (tk - dk[(size_t) i]);
+            dbs[(size_t) i] += 0.12f * (tb - dbs[(size_t) i]);
+            dor[(size_t) i] += 0.12f * (to - dor[(size_t) i]);
+        }
+    }
+    dispInit = true;
+
+    Path pk, pb, po;
     for (int i = 0; i < N; ++i)
     {
         const float x = b.getX() + b.getWidth() * (float) i / (float) (N - 1);
-        const float yk = cy - proc.zoomKick[(size_t) i].load() * hh;
-        const float yb = cy - proc.zoomBass[(size_t) i].load() * hh;
-        if (i == 0) { pk.startNewSubPath (x, yk); pb.startNewSubPath (x, yb); }
-        else { pk.lineTo (x, yk); pb.lineTo (x, yb); }
+        const float yk = cy - dk[(size_t) i] * hh;
+        const float yb = cy - dbs[(size_t) i] * hh;
+        const float yo = cy - dor[(size_t) i] * hh;
+        if (i == 0) { pk.startNewSubPath (x, yk); pb.startNewSubPath (x, yb); po.startNewSubPath (x, yo); }
+        else { pk.lineTo (x, yk); pb.lineTo (x, yb); po.lineTo (x, yo); }
     }
+    g.setColour (kCream.withAlpha (0.35f)); g.strokePath (po, PathStrokeType (1.5f));
     g.setColour (kOrange); g.strokePath (pk, PathStrokeType (2.5f));
     g.setColour (kCream); g.strokePath (pb, PathStrokeType (2.5f));
+}
+
+void KickDuckEditor::drawAnim (Graphics& g, Rectangle<float> b)
+{
+    const auto& d = proc.anim;
+    const int len = (int) d.k.size();
+    if (len < 16 || d.b.size() != d.k.size() || d.start >= len - 8) return;
+
+    const float p = jlimit (0.0f, 1.0f, (float) (Time::getMillisecondCounter() - d.startMs) / (float) KickDuckProcessor::kAnimMs);
+    const float e = p * p * (3.0f - 2.0f * p);
+    const float theta = jmap (e, d.ph0, d.ph1);
+    const float dMs = jmap (e, d.d0, d.d1);
+    const int s = roundToInt (dMs * (float) d.fs / 1000.0f);
+    const float sg = jmap (e, d.pol0 > 0.5f ? -1.0f : 1.0f, d.pol1 > 0.5f ? -1.0f : 1.0f);
+
+    bool bypass = theta < 0.5f;
+    float sgn = 1.0f, ac = 0.0f;
+    if (theta >= 179.5f) { bypass = true; sgn = -1.0f; }
+    if (! bypass)
+    {
+        const float f0 = jlimit (1.0f, (float) (d.fs * 0.45), d.fc / std::tan (degreesToRadians (theta) * 0.5f));
+        const float tn = std::tan (MathConstants<float>::pi * f0 / (float) d.fs);
+        ac = (tn - 1.0f) / (tn + 1.0f);
+    }
+    std::vector<float> pbv ((size_t) len);
+    float x1 = 0.0f, y1 = 0.0f;
+    for (int i = 0; i < len; ++i)
+    {
+        const float x = d.b[(size_t) i];
+        const float y = bypass ? x : (ac * x + x1 - ac * y1);
+        x1 = x; y1 = y;
+        pbv[(size_t) i] = y * sgn;
+    }
+
+    float m = 1.0e-6f;
+    for (int i = d.start; i < len; ++i) m = jmax (m, std::abs (d.k[(size_t) i]), std::abs (d.b[(size_t) i]));
+
+    const int N = 400;
+    const float cy = b.getCentreY(), hh = b.getHeight() * 0.42f;
+    Path pk, pb, po;
+    for (int n = 0; n < N; ++n)
+    {
+        const int i = d.start + n * (len - 1 - d.start) / (N - 1);
+        const int j = i - s;
+        const float vb = (j >= 0 && j < len) ? pbv[(size_t) j] * sg : 0.0f;
+        const float x = b.getX() + b.getWidth() * (float) n / (float) (N - 1);
+        const float yk = cy - d.k[(size_t) i] / m * hh;
+        const float yb = cy - vb / m * hh;
+        const float yo = cy - d.b[(size_t) i] / m * hh;
+        if (n == 0) { pk.startNewSubPath (x, yk); pb.startNewSubPath (x, yb); po.startNewSubPath (x, yo); }
+        else { pk.lineTo (x, yk); pb.lineTo (x, yb); po.lineTo (x, yo); }
+    }
+    g.setColour (kCream.withAlpha (0.35f)); g.strokePath (po, PathStrokeType (1.5f));
+    g.setColour (kOrange); g.strokePath (pk, PathStrokeType (2.5f));
+    g.setColour (kCream); g.strokePath (pb, PathStrokeType (2.5f));
+
+    g.setColour (Colours::white); g.setFont (Font (FontOptions (13.0f, Font::bold)));
+    g.drawText (U8 ("Alineando…  Fase ") + String (theta, 0) + U8 ("°  ·  Delay ") + String (dMs, 2) + " ms  ·  "
+                    + (sg < 0.0f ? U8 ("polaridad invertida") : U8 ("polaridad normal")),
+                b.toNearestInt().removeFromBottom (20), Justification::centred);
+    g.setColour (kGrid);
+    g.fillRoundedRectangle (b.getX(), b.getBottom() - 4.0f, b.getWidth(), 3.0f, 1.5f);
+    g.setColour (kOrange);
+    g.fillRoundedRectangle (b.getX(), b.getBottom() - 4.0f, b.getWidth() * p, 3.0f, 1.5f);
 }
 
 void KickDuckEditor::drawCorrelation (Graphics& g, Rectangle<float> b)
 {
     const bool valid = proc.corrValid.load();
-    const float c = proc.correlation.load();
+    const float db = proc.sumDb.load();
     String txt = U8 ("Esperando kick…");
     Colour col = kMuted;
     if (valid)
     {
-        if (c >= 0.6f) { txt = U8 ("● En fase · ") + String (c, 2); col = kGreen; }
-        else if (c >= 0.2f) { txt = U8 ("● Parcial · ") + String (c, 2); col = kAmber; }
-        else { txt = U8 ("● Fuera de fase · ") + String (c, 2); col = kRed; }
+        const String v = String (db >= 0.0f ? "+" : "") + String (db, 1) + " dB";
+        if (db >= 0.5f) { txt = U8 ("● Suman · ") + v; col = kGreen; }
+        else if (db >= -1.5f) { txt = U8 ("● Neutro · ") + v; col = kAmber; }
+        else { txt = U8 ("● Se restan · ") + v; col = kRed; }
     }
     g.setColour (kMuted); g.setFont (Font (FontOptions (12.0f)));
-    g.drawText ("CORRELACION", b.toNearestInt().removeFromTop (18).withTrimmedLeft (14), Justification::centredLeft);
+    g.drawText (U8 ("KICK + BAJO: SUMA FRENTE A SEPARADOS"), b.toNearestInt().removeFromTop (18).withTrimmedLeft (14), Justification::centredLeft);
     g.setColour (col); g.setFont (Font (FontOptions (14.0f, Font::bold)));
     g.drawText (txt, b.toNearestInt().removeFromTop (18).withTrimmedRight (14), Justification::centredRight);
 
     auto bar = b.reduced (14.0f, 0.0f).withTrimmedTop (30.0f).withHeight (14.0f);
     ColourGradient grad (kRed, bar.getX(), 0, kGreen, bar.getRight(), 0, false);
     grad.addColour (0.5, kAmber);
+    grad.addColour (0.72, kGreen);
     g.setGradientFill (grad);
     g.fillRoundedRectangle (bar, 7.0f);
     if (valid)
     {
-        const float x = bar.getX() + bar.getWidth() * (jlimit (-1.0f, 1.0f, c) * 0.5f + 0.5f);
+        const float x = bar.getX() + bar.getWidth() * (jlimit (-6.0f, 3.0f, db) + 6.0f) / 9.0f;
         g.setColour (Colours::white);
         g.fillRoundedRectangle (x - 2, bar.getY() - 4, 4, bar.getHeight() + 8, 2.0f);
     }
     g.setColour (kMuted); g.setFont (Font (FontOptions (11.0f)));
     auto lab = b.toNearestInt().withTrimmedLeft (14).withTrimmedRight (14).removeFromBottom (16);
-    g.drawText (U8 ("-1 se cancelan"), lab, Justification::centredLeft);
-    g.drawText ("0", lab, Justification::centred);
-    g.drawText (U8 ("+1 en fase"), lab, Justification::centredRight);
+    g.drawText (U8 ("-6 dB se restan"), lab, Justification::centredLeft);
+    g.drawText (U8 ("0 dB = ni suma ni resta"),
+                Rectangle<int> ((int) (bar.getX() + bar.getWidth() * 0.667f) - 80, lab.getY(), 160, lab.getHeight()), Justification::centred);
+    g.drawText (U8 ("+3 dB suman"), lab, Justification::centredRight);
 }
 
 void KickDuckEditor::paint (Graphics& g)
@@ -316,7 +414,7 @@ void KickDuckEditor::paint (Graphics& g)
 
     const float ms = (float) proc.getLatencySamples() / (float) jmax (1.0, proc.getSampleRate()) * 1000.0f;
     g.setColour (kMuted); g.setFont (Font (FontOptions (12.0f)));
-    g.drawText (U8 ("LATENCIA ") + String (ms, 0) + " ms", getWidth() / 2 - 40, 20, 160, 44, Justification::centredLeft);
+    g.drawText (U8 ("LATENCIA ") + String (ms, 0) + " ms", 24, getHeight() - 28, 200, 20, Justification::centredLeft);
 
     g.setColour (kPanel);
     g.fillRoundedRectangle (panel.toFloat(), 12.0f);
@@ -343,10 +441,12 @@ void KickDuckEditor::paint (Graphics& g)
     }
     else
     {
-        drawZoom (g, inner);
+        if (proc.autoState.load() == 6 && proc.anim.active) drawAnim (g, inner);
+        else drawZoom (g, inner);
         g.setFont (Font (FontOptions (12.0f)));
         g.setColour (kOrange); g.drawText (U8 ("● Kick (graves)"), panel.getX() + 14, panel.getY() + 4, 120, 16, Justification::left);
-        g.setColour (kCream);  g.drawText (U8 ("● Bajo (graves)"), panel.getX() + 134, panel.getY() + 4, 120, 16, Justification::left);
+        g.setColour (kCream);  g.drawText (U8 ("● Bajo corregido"), panel.getX() + 134, panel.getY() + 4, 130, 16, Justification::left);
+        g.setColour (kCream.withAlpha (0.45f)); g.drawText (U8 ("● Bajo original"), panel.getX() + 264, panel.getY() + 4, 130, 16, Justification::left);
         g.setColour (kMuted);  g.drawText ("Zoom 20-70 ms", panel.getRight() - 134, panel.getY() + 4, 120, 16, Justification::right);
 
         g.setColour (kPanel);

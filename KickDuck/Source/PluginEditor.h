@@ -32,6 +32,7 @@ private:
     void drawScope (juce::Graphics&, juce::Rectangle<float>);
     void drawCurveEditor (juce::Graphics&, juce::Rectangle<float>);
     void drawZoom (juce::Graphics&, juce::Rectangle<float>);
+    void drawAnim (juce::Graphics&, juce::Rectangle<float>);
     void drawCorrelation (juce::Graphics&, juce::Rectangle<float>);
 
     KickDuckProcessor& proc;
@@ -52,7 +53,11 @@ private:
     enum { kAmount, kRelease, kThr, kMix, kAttack, kHold, kLp, kPhase, kDelay, kSens, kSmooth, kNumKnobs };
     Knob knobs[kNumKnobs];
 
-    std::unique_ptr<CA> modeAtt, curveAtt;
+    juce::ToggleButton freezeBtn { "Congelar" };
+    juce::ComboBox winBox;
+    std::array<float, KickDuckProcessor::kZoomPoints> dk {}, dbs {}, dor {};
+    bool dispInit = false;
+    std::unique_ptr<CA> modeAtt, curveAtt, winAtt;
     std::unique_ptr<BA> fullAtt, polAtt, lockPolAtt, lockPhAtt, lockDelAtt;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (KickDuckEditor)

@@ -108,6 +108,22 @@ public:
     std::atomic<float> kickLevel { 0.0f };
     std::atomic<int> autoState { 0 }; // 0 libre,1 capturando,2 listo,3 buscando,4 ok,5 sin senal
     std::atomic<float> autoScore { 0.0f };
+    std::atomic<float> sumDb { 0.0f };
+    std::array<std::atomic<float>, kZoomPoints> zoomBassOrig;
+    std::atomic<bool> freeze { false };
+
+    // animacion visual del Auto-fase (solo hilo de mensajes)
+    static constexpr int kAnimMs = 4000;
+    struct AnimData
+    {
+        bool active = false;
+        juce::uint32 startMs = 0;
+        float pol0 = 0, ph0 = 0, d0 = 0, pol1 = 0, ph1 = 0, d1 = 0, fc = 150.0f;
+        double fs = 44100.0;
+        int start = 0;
+        std::vector<float> k, b;
+    } anim;
+    void commitAutoPhase();
     std::atomic<int> capShown { 0 };
     std::atomic<int> copyState { 0 };     // 0 libre,1 copiando,2 listo,3 sin senal,4 aplicado
     std::atomic<int> copyHitsShown { 0 };
@@ -120,6 +136,7 @@ private:
     void finishCapture();
     void startAutoPhaseSearch();
     void finishCopy();
+    void recomputeApplied (float lp, int L);
     void resetDspState();
 
     double sr = 44100.0;
@@ -127,7 +144,7 @@ private:
     int ringSize = 0;
 
     std::atomic<float> *pMode, *pCurveMode, *pAmount, *pRelease, *pThr, *pMix, *pAttack, *pHold,
-        *pLp, *pFull, *pPhase, *pDelay, *pPol, *pSens, *pSmooth;
+        *pLp, *pFull, *pPhase, *pDelay, *pPol, *pSens, *pSmooth, *pScopeWin;
 
     kd::Ring ringIn[2], ringKick, rawKick, rawBass;
     juce::dsp::LinkwitzRileyFilter<float> lr[2];
@@ -154,6 +171,11 @@ private:
     float envF = 0.0f, cpEnv = 0.0f;
     int cpPos = -1, cpLen = 0, cpHits = 0, cpElapsed = 0;
     bool wasSplit = false;
+    float appPhase = 0.0f, appDelayMs = 0.0f, apA = 0.0f, apSign = 1.0f, polSign = 1.0f;
+    bool appPol = false, appInit = false, apBypass = true;
+    int wetDelay = 0, pendingCount = 0;
+    kd::Biquad lpBassOrig;
+    std::vector<float> zo;
     int tailSkip = 0;
     float cpBin[kCurvePoints] {}, cpAcc[kCurvePoints] {};
     std::atomic<bool> cpActive { false }, cpReset { false };
